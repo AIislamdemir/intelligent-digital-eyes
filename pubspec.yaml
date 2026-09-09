@@ -1,0 +1,30 @@
+name: accessai
+description: "AccessAI - Görme engelli ve az gören kullanıcılar için AI destekli çevre farkındalık asistanı."
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Kamera erişimi (canlı önizleme + kare akışı)
+  camera: ^0.11.0
+
+  # Metin-konuşma (native TTS, çevrimdışı çalışır)
+  flutter_tts: ^4.0.2
+
+  # İzin yönetimi (kamera, mikrofon)
+  permission_handler: ^11.3.1
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
