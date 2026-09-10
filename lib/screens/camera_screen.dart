@@ -1,18 +1,18 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../main.dart';
 import '../services/tts_service.dart';
+import '../services/object_detection_service.dart';
 
 /// AccessAI'ın ana ekranı.
 ///
-/// Bu aşamada (Faz 1) sadece:
-///  - Kamera izni ister
-///  - Canlı kamera önizlemesi gösterir
-///  - Ekrana dokununca TTS ile geri bildirim verir (AI entegrasyonu için yer tutucu)
-///
-/// YOLO26-N / derinlik / OCR entegrasyonu bir sonraki adımda buraya bir
-/// "FrameProcessor" olarak eklenecek (native platform channel üzerinden).
+/// Faz 1 - Görev 2: YOLO26-N artık gerçek zamanlı çalışıyor.
+/// Tasarım kararı: her kamera karesinde DEĞİL, ~900ms'de bir kare
+/// işleniyor (bkz. teknoloji karar raporu Bölüm 2 — sürekli VLM/CV
+/// çalıştırmak yerine kontrollü örnekleme, pil ve gecikme için).
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
 
@@ -24,10 +24,18 @@ class _CameraScreenState extends State<CameraScreen>
     with WidgetsBindingObserver {
   CameraController? _controller;
   final TtsService _tts = TtsService();
+  final ObjectDetectionService _detector = ObjectDetectionService();
 
   bool _permissionGranted = false;
   bool _cameraReady = false;
+  bool _modelReady = false;
+  bool _detectionActive = false; // "Çevreyi Tarif Et" açık/kapalı
+  bool _isProcessingFrame = false;
   String _statusMessage = 'Başlatılıyor...';
+
+  Timer? _detectionTimer;
+  String? _lastSpokenLabel;
+  DateTime _lastSpokenAt = DateTime.now().subtract(const Duration(minutes: 1));
 
   @override
   void initState() {
@@ -38,7 +46,19 @@ class _CameraScreenState extends State<CameraScreen>
 
   Future<void> _initialize() async {
     await _tts.init();
+    await _loadModel();
     await _requestPermissionsAndStartCamera();
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      final bytes = await rootBundle.load('assets/models/yolo26n.onnx');
+      await _detector.loadModelFromBytes(bytes.buffer.asUint8List());
+      if (mounted) setState(() => _modelReady = true);
+    } catch (e) {
+      debugPrint('Model yüklenemedi: $e');
+      // Model yüklenemese bile kamera + TTS iskeleti çalışmaya devam etsin.
+    }
   }
 
   Future<void> _requestPermissionsAndStartCamera() async {
@@ -66,7 +86,6 @@ class _CameraScreenState extends State<CameraScreen>
       return;
     }
 
-    // Arka (dünyaya bakan) kamerayı tercih et.
     final backCamera = availableCamerasList.firstWhere(
       (cam) => cam.lensDirection == CameraLensDirection.back,
       orElse: () => availableCamerasList.first,
@@ -74,9 +93,9 @@ class _CameraScreenState extends State<CameraScreen>
 
     final controller = CameraController(
       backCamera,
-      ResolutionPreset.medium, // MVP: hız için orta çözünürlük yeterli
+      ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420, // native inference için uygun format
+      imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
@@ -94,12 +113,70 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
-  /// Yer tutucu: gerçek algı (YOLO26-N + derinlik) entegre edilene kadar
-  /// kullanıcıya sistemin çalıştığını doğrulayan bir sesli yanıt verir.
+  /// "Çevreyi Tarif Et" butonuna basınca sürekli algılamayı aç/kapat.
   Future<void> _onDescribeTapped() async {
     if (!_cameraReady) return;
-    await _tts.speak(
-        'Sahne analizi henüz bağlı değil. Bu, yapay zeka algı katmanının ekleneceği yerdir.');
+
+    if (!_modelReady) {
+      await _tts.speak(
+          'Nesne algılama modeli henüz hazır değil, lütfen birkaç saniye bekleyin.');
+      return;
+    }
+
+    setState(() => _detectionActive = !_detectionActive);
+
+    if (_detectionActive) {
+      await _tts.speak('Çevre algılama açık.');
+      _startDetectionLoop();
+    } else {
+      await _tts.speak('Çevre algılama kapalı.');
+      _detectionTimer?.cancel();
+    }
+  }
+
+  void _startDetectionLoop() {
+    _detectionTimer?.cancel();
+    _detectionTimer = Timer.periodic(const Duration(milliseconds: 900), (_) {
+      _processFrame();
+    });
+  }
+
+  Future<void> _processFrame() async {
+    final controller = _controller;
+    if (controller == null || _isProcessingFrame || !_detectionActive) return;
+
+    _isProcessingFrame = true;
+    try {
+      // startImageStream yerine periyodik tek-kare yaklaşımı: basitlik ve
+      // pil tüketimi için. V2'de gerçek stream + arka plan izole edilebilir.
+      await controller.startImageStream((CameraImage image) async {
+        await controller.stopImageStream();
+        final detections = await _detector.runOnFrame(image);
+        await _handleDetections(detections);
+      });
+    } catch (e) {
+      debugPrint('Kare işleme hatası: $e');
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  Future<void> _handleDetections(List<Detection> detections) async {
+    if (detections.isEmpty) return;
+
+    final top = detections.first;
+
+    // Temporal consistency: aynı etiketi art arda 4 saniyeden önce tekrar
+    // söyleme (bkz. rapor Bölüm 10 — "Araba. Araba. Araba." önleme).
+    final now = DateTime.now();
+    final sameLabel = _lastSpokenLabel == top.labelTr;
+    final tooSoon = now.difference(_lastSpokenAt) < const Duration(seconds: 4);
+    if (sameLabel && tooSoon) return;
+
+    _lastSpokenLabel = top.labelTr;
+    _lastSpokenAt = now;
+
+    await _tts.speak('${top.labelTr} ${top.position}');
   }
 
   @override
@@ -108,6 +185,7 @@ class _CameraScreenState extends State<CameraScreen>
     if (controller == null || !controller.value.isInitialized) return;
 
     if (state == AppLifecycleState.inactive) {
+      _detectionTimer?.cancel();
       controller.dispose();
     } else if (state == AppLifecycleState.resumed) {
       _startCamera();
@@ -117,7 +195,9 @@ class _CameraScreenState extends State<CameraScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _detectionTimer?.cancel();
     _controller?.dispose();
+    _detector.dispose();
     _tts.dispose();
     super.dispose();
   }
@@ -131,20 +211,33 @@ class _CameraScreenState extends State<CameraScreen>
                 fit: StackFit.expand,
                 children: [
                   CameraPreview(_controller!),
+                  if (!_modelReady)
+                    const Positioned(
+                      top: 16,
+                      left: 16,
+                      right: 16,
+                      child: LinearProgressIndicator(),
+                    ),
                   Positioned(
                     bottom: 32,
                     left: 24,
                     right: 24,
                     child: Semantics(
-                      label: 'Çevreyi tarif et. Dokunarak etkinleştirin.',
+                      label: _detectionActive
+                          ? 'Çevre algılama açık. Kapatmak için dokunun.'
+                          : 'Çevreyi tarif et. Dokunarak etkinleştirin.',
                       button: true,
                       child: ElevatedButton(
                         onPressed: _onDescribeTapped,
                         style: ElevatedButton.styleFrom(
                           minimumSize: const Size.fromHeight(72),
                           textStyle: const TextStyle(fontSize: 22),
+                          backgroundColor:
+                              _detectionActive ? Colors.green : null,
                         ),
-                        child: const Text('Çevreyi Tarif Et'),
+                        child: Text(_detectionActive
+                            ? 'Algılama Açık (Durdur)'
+                            : 'Çevreyi Tarif Et'),
                       ),
                     ),
                   ),

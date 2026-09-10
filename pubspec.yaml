@@ -19,6 +19,12 @@ dependencies:
   # İzin yönetimi (kamera, mikrofon)
   permission_handler: ^11.3.1
 
+  # YOLO26-N ONNX modelini cihaz üstünde çalıştırmak için
+  onnxruntime_v2: 1.23.2+2
+
+  # YUV420 -> RGB dönüşümü ve resize için
+  image: ^4.2.0
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
@@ -28,3 +34,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/models/yolo26n.onnx
