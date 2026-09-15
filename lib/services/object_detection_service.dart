@@ -1,90 +1,118 @@
-import 'dart:async';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:image/image.dart' as img;
 import 'package:onnxruntime_v2/onnxruntime_v2.dart';
 import 'coco_labels_tr.dart';
 
-/// Tek bir algılama sonucu: sınıf adı, güven skoru ve kabaca konum.
+/// Tek bir algılama sonucu: sınıf adı, güven skoru, kabaca konum ve
+/// derinlik modeline aktarmak için 0-1 aralığında normalize edilmiş
+/// merkez koordinatları.
 class Detection {
   final String labelTr;
   final double confidence;
   final String position; // 'solunuzda', 'önünüzde', 'sağınızda'
-  Detection(this.labelTr, this.confidence, this.position);
+  final double xRatio; // 0.0 (sol) - 1.0 (sağ)
+  final double yRatio; // 0.0 (üst) - 1.0 (alt)
+  Detection(this.labelTr, this.confidence, this.position, this.xRatio, this.yRatio);
 }
 
 /// YOLO26-N (ONNX, 320x320 giriş) modelini cihaz üstünde çalıştırır.
 ///
-/// Tasarım kararı: her kamera karesinde değil, `runOnFrame` dışarıdan
-/// kontrollü aralıklarla (örn. 700-1000ms'de bir) çağrılmalı — bkz.
-/// teknoloji karar raporu Bölüm 2 (hibrit mimari, sürekli çıkarım değil).
+/// `onnxruntime_v2` paketi kullanılıyor (eski `onnxruntime` paketinin
+/// Android SDK 34+ uyumluluğu güncellenmiş sürümü).
+///
+/// Tasarım kararı: her kamera karesinde değil, dışarıdan (camera_screen.dart)
+/// kontrollü aralıklarla (900ms) çağrılmalı — bkz. teknoloji karar raporu
+/// Bölüm 2 (hibrit mimari, sürekli çıkarım değil).
 class ObjectDetectionService {
   static const int inputSize = 320;
   static const double confidenceThreshold = 0.45;
 
   OrtSession? _session;
+  String? _inputName;
+  String? _outputName;
+
   bool get isReady => _session != null;
 
-  /// Modeli yükler. `modelBytes`, camera_screen.dart içinde
-  /// `rootBundle.load('assets/models/yolo26n.onnx')` ile okunup buraya
-  /// verilir (bu servis widget bağlamından bağımsız kalsın diye).
-  Future<void> loadModelFromBytes(Uint8List modelBytes) async {
+  /// Modeli assets içinden yükler.
+  Future<void> loadModel({
+    String assetPath = 'assets/models/yolo26n.onnx',
+  }) async {
     OrtEnv.instance.init();
     final sessionOptions = OrtSessionOptions();
-    _session = OrtSession.fromBuffer(modelBytes, sessionOptions);
+
+    final rawAsset = await rootBundle.load(assetPath);
+    final modelBytes = rawAsset.buffer.asUint8List();
+
+    final session = OrtSession.fromBuffer(modelBytes, sessionOptions);
+    _session = session;
+
+    _inputName = session.inputNames.isNotEmpty ? session.inputNames.first : 'images';
+    _outputName =
+        session.outputNames.isNotEmpty ? session.outputNames.first : 'output0';
   }
 
   /// Kameradan gelen ham CameraImage'ı (YUV420) alır, YOLO26-N ile
-  /// işler, eşiği geçen en güvenilir 1-2 algılamayı döndürür.
+  /// işler, eşiği geçen en güvenilir algılamayı döndürür.
   Future<List<Detection>> runOnFrame(CameraImage cameraImage) async {
     final session = _session;
-    if (session == null) return [];
+    if (session == null || _inputName == null || _outputName == null) {
+      return [];
+    }
 
-    // 1) YUV420 -> RGB dönüşümü (image paketiyle)
+    // 1) YUV420 -> RGB dönüşümü
     final rgbImage = _convertYUV420ToImage(cameraImage);
 
-    // 2) 320x320'e resize + letterbox yok (basitlik için doğrudan resize)
+    // 2) 320x320'e resize
     final resized = img.copyResize(rgbImage, width: inputSize, height: inputSize);
 
     // 3) Float32 [1,3,320,320], 0-1 normalize, CHW sırası
-    final inputTensorData = Float32List(1 * 3 * inputSize * inputSize);
+    final inputData = Float32List(1 * 3 * inputSize * inputSize);
     int idx = 0;
     for (int c = 0; c < 3; c++) {
       for (int y = 0; y < inputSize; y++) {
         for (int x = 0; x < inputSize; x++) {
           final pixel = resized.getPixel(x, y);
           final value = c == 0 ? pixel.r : (c == 1 ? pixel.g : pixel.b);
-          inputTensorData[idx++] = value / 255.0;
+          inputData[idx++] = value / 255.0;
         }
       }
     }
 
     final inputOrt = OrtValueTensor.createTensorWithDataList(
-      inputTensorData,
+      inputData,
       [1, 3, inputSize, inputSize],
     );
 
-    final inputs = {'images': inputOrt};
+    final inputs = {_inputName!: inputOrt};
     final runOptions = OrtRunOptions();
     final outputs = session.run(runOptions, inputs);
     inputOrt.release();
     runOptions.release();
 
-    // Çıktı şekli: [1, 84, 2100] -> 4 kutu koordinatı + 80 sınıf skoru
-    final rawOutput = outputs.first?.value as List;
-    final flat = (rawOutput[0] as List); // [84, 2100]
+    final outputTensor = outputs.firstWhere(
+      (o) => o != null,
+      orElse: () => null,
+    );
 
-    final detections = <Detection>[];
+    if (outputTensor == null) return [];
+
+    // Çıktı şekli: [1, 84, 2100] -> 4 kutu koordinatı + 80 sınıf skoru.
+    final rawOutput = outputTensor.value as List;
+    final channels = (rawOutput[0] as List); // [84][2100]
+    final numBoxes = (channels[0] as List).length;
+
     double bestConf = 0;
     int bestClass = -1;
     double bestX = 0;
+    double bestY = 0;
 
-    final numBoxes = (flat[0] as List).length; // 2100
     for (int i = 0; i < numBoxes; i++) {
       double maxClsScore = 0;
       int maxClsIdx = -1;
       for (int c = 0; c < 80; c++) {
-        final score = (flat[4 + c] as List)[i] as double;
+        final score = ((channels[4 + c] as List)[i] as num).toDouble();
         if (score > maxClsScore) {
           maxClsScore = score;
           maxClsIdx = c;
@@ -93,7 +121,8 @@ class ObjectDetectionService {
       if (maxClsScore > bestConf) {
         bestConf = maxClsScore;
         bestClass = maxClsIdx;
-        bestX = (flat[0] as List)[i] as double; // normalize edilmemiş x-center
+        bestX = ((channels[0] as List)[i] as num).toDouble();
+        bestY = ((channels[1] as List)[i] as num).toDouble();
       }
     }
 
@@ -104,14 +133,15 @@ class ObjectDetectionService {
     if (bestConf >= confidenceThreshold && bestClass >= 0) {
       final label = cocoLabelsTr[bestClass] ?? 'bilinmeyen nesne';
       final position = _positionFromX(bestX);
-      detections.add(Detection(label, bestConf, position));
+      final xRatio = (bestX / inputSize).clamp(0.0, 1.0);
+      final yRatio = (bestY / inputSize).clamp(0.0, 1.0);
+      return [Detection(label, bestConf, position, xRatio, yRatio)];
     }
 
-    return detections;
+    return [];
   }
 
   String _positionFromX(double xCenter) {
-    // xCenter, 320px giriş uzayında; 3 bölgeye ayır.
     if (xCenter < inputSize * 0.33) return 'solunuzda';
     if (xCenter > inputSize * 0.66) return 'sağınızda';
     return 'önünüzde';

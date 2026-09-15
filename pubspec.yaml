@@ -20,7 +20,7 @@ dependencies:
   permission_handler: ^11.3.1
 
   # YOLO26-N ONNX modelini cihaz üstünde çalıştırmak için
-  onnxruntime_v2: 1.23.2+2
+  onnxruntime_v2: ^1.23.2+2
 
   # YUV420 -> RGB dönüşümü ve resize için
   image: ^4.2.0
@@ -36,3 +36,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/yolo26n.onnx
+    - assets/models/fused_model_uint8_256.onnx

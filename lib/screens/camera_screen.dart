@@ -6,6 +6,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../main.dart';
 import '../services/tts_service.dart';
 import '../services/object_detection_service.dart';
+import '../services/depth_estimation_service.dart';
 
 /// AccessAI'ın ana ekranı.
 ///
@@ -25,10 +26,12 @@ class _CameraScreenState extends State<CameraScreen>
   CameraController? _controller;
   final TtsService _tts = TtsService();
   final ObjectDetectionService _detector = ObjectDetectionService();
+  final DepthEstimationService _depthService = DepthEstimationService();
 
   bool _permissionGranted = false;
   bool _cameraReady = false;
   bool _modelReady = false;
+  bool _depthReady = false;
   bool _detectionActive = false; // "Çevreyi Tarif Et" açık/kapalı
   bool _isProcessingFrame = false;
   String _statusMessage = 'Başlatılıyor...';
@@ -52,12 +55,20 @@ class _CameraScreenState extends State<CameraScreen>
 
   Future<void> _loadModel() async {
     try {
-      final bytes = await rootBundle.load('assets/models/yolo26n.onnx');
-      await _detector.loadModelFromBytes(bytes.buffer.asUint8List());
+      await _detector.loadModel(assetPath: 'assets/models/yolo26n.onnx');
       if (mounted) setState(() => _modelReady = true);
     } catch (e) {
-      debugPrint('Model yüklenemedi: $e');
-      // Model yüklenemese bile kamera + TTS iskeleti çalışmaya devam etsin.
+      debugPrint('Nesne algılama modeli yüklenemedi: $e');
+    }
+    try {
+      await _depthService.loadModel(
+        assetPath: 'assets/models/fused_model_uint8_256.onnx',
+      );
+      _depthReady = true;
+    } catch (e) {
+      debugPrint('Derinlik modeli yüklenemedi (mesafesiz devam edilecek): $e');
+      // Kritik değil: derinlik modeli yüklenemezse sistem sadece konum
+      // söylemeye devam eder, mesafe bilgisi olmadan (kademeli bozulma).
     }
   }
 
@@ -152,7 +163,7 @@ class _CameraScreenState extends State<CameraScreen>
       await controller.startImageStream((CameraImage image) async {
         await controller.stopImageStream();
         final detections = await _detector.runOnFrame(image);
-        await _handleDetections(detections);
+        await _handleDetections(detections, image);
       });
     } catch (e) {
       debugPrint('Kare işleme hatası: $e');
@@ -161,7 +172,10 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
-  Future<void> _handleDetections(List<Detection> detections) async {
+  Future<void> _handleDetections(
+    List<Detection> detections,
+    CameraImage sourceImage,
+  ) async {
     if (detections.isEmpty) return;
 
     final top = detections.first;
@@ -176,7 +190,24 @@ class _CameraScreenState extends State<CameraScreen>
     _lastSpokenLabel = top.labelTr;
     _lastSpokenAt = now;
 
-    await _tts.speak('${top.labelTr} ${top.position}');
+    String message = '${top.labelTr} ${top.position}';
+
+    if (_depthReady) {
+      try {
+        final distanceLabel = await _depthService.estimateDistanceLabel(
+          sourceImage,
+          focusXRatio: top.xRatio,
+          focusYRatio: top.yRatio,
+        );
+        if (distanceLabel != null) {
+          message = '${top.labelTr} ${top.position}, $distanceLabel';
+        }
+      } catch (e) {
+        debugPrint('Derinlik tahmini başarısız, mesafesiz devam: $e');
+      }
+    }
+
+    await _tts.speak(message);
   }
 
   @override
@@ -198,6 +229,7 @@ class _CameraScreenState extends State<CameraScreen>
     _detectionTimer?.cancel();
     _controller?.dispose();
     _detector.dispose();
+    _depthService.dispose();
     _tts.dispose();
     super.dispose();
   }
