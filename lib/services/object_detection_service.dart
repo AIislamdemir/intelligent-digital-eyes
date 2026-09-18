@@ -28,6 +28,7 @@ class Detection {
 class ObjectDetectionService {
   static const int inputSize = 320;
   static const double confidenceThreshold = 0.45;
+  static const int maxDetectionsPerFrame = 3;
 
   OrtSession? _session;
   String? _inputName;
@@ -54,7 +55,8 @@ class ObjectDetectionService {
   }
 
   /// Kameradan gelen ham CameraImage'ı (YUV420) alır, YOLO26-N ile
-  /// işler, eşiği geçen en güvenilir algılamayı döndürür.
+  /// işler, eşiği geçen en fazla [maxDetectionsPerFrame] farklı nesneyi
+  /// (soldan sağa sıralı) döndürür.
   Future<List<Detection>> runOnFrame(CameraImage cameraImage) async {
     final session = _session;
     if (session == null || _inputName == null || _outputName == null) {
@@ -103,10 +105,11 @@ class ObjectDetectionService {
     final channels = (rawOutput[0] as List); // [84][2100]
     final numBoxes = (channels[0] as List).length;
 
-    double bestConf = 0;
-    int bestClass = -1;
-    double bestX = 0;
-    double bestY = 0;
+    // Her kutu için en yüksek sınıf skorunu bul, eşiği geçenleri topla.
+    // (Sınıf başına yalnızca en güvenilir kutuyu tutuyoruz — aynı nesne
+    // için birden çok grid hücresinin aynı anda tetiklenmesini basitçe
+    // önlemek için. Tam NMS (IoU tabanlı) değil ama MVP için yeterli.)
+    final Map<int, ({double conf, double x, double y})> bestPerClass = {};
 
     for (int i = 0; i < numBoxes; i++) {
       double maxClsScore = 0;
@@ -118,11 +121,13 @@ class ObjectDetectionService {
           maxClsIdx = c;
         }
       }
-      if (maxClsScore > bestConf) {
-        bestConf = maxClsScore;
-        bestClass = maxClsIdx;
-        bestX = ((channels[0] as List)[i] as num).toDouble();
-        bestY = ((channels[1] as List)[i] as num).toDouble();
+      if (maxClsScore < confidenceThreshold || maxClsIdx < 0) continue;
+
+      final existing = bestPerClass[maxClsIdx];
+      if (existing == null || maxClsScore > existing.conf) {
+        final x = ((channels[0] as List)[i] as num).toDouble();
+        final y = ((channels[1] as List)[i] as num).toDouble();
+        bestPerClass[maxClsIdx] = (conf: maxClsScore, x: x, y: y);
       }
     }
 
@@ -130,15 +135,22 @@ class ObjectDetectionService {
       o?.release();
     }
 
-    if (bestConf >= confidenceThreshold && bestClass >= 0) {
-      final label = cocoLabelsTr[bestClass] ?? 'bilinmeyen nesne';
-      final position = _positionFromX(bestX);
-      final xRatio = (bestX / inputSize).clamp(0.0, 1.0);
-      final yRatio = (bestY / inputSize).clamp(0.0, 1.0);
-      return [Detection(label, bestConf, position, xRatio, yRatio)];
-    }
+    if (bestPerClass.isEmpty) return [];
 
-    return [];
+    // En güvenilir 3 farklı nesneyi al, sonra soldan sağa sırala
+    // (doğal konuşma sırası — "solunuzda... önünüzde... sağınızda" gibi).
+    final entries = bestPerClass.entries.toList()
+      ..sort((a, b) => b.value.conf.compareTo(a.value.conf));
+    final top = entries.take(maxDetectionsPerFrame).toList()
+      ..sort((a, b) => a.value.x.compareTo(b.value.x));
+
+    return top.map((e) {
+      final label = cocoLabelsTr[e.key] ?? 'bilinmeyen nesne';
+      final position = _positionFromX(e.value.x);
+      final xRatio = (e.value.x / inputSize).clamp(0.0, 1.0);
+      final yRatio = (e.value.y / inputSize).clamp(0.0, 1.0);
+      return Detection(label, e.value.conf, position, xRatio, yRatio);
+    }).toList();
   }
 
   String _positionFromX(double xCenter) {

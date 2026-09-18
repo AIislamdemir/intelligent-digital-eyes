@@ -37,8 +37,10 @@ class _CameraScreenState extends State<CameraScreen>
   String _statusMessage = 'Başlatılıyor...';
 
   Timer? _detectionTimer;
-  String? _lastSpokenLabel;
-  DateTime _lastSpokenAt = DateTime.now().subtract(const Duration(minutes: 1));
+  // Her etiket için ayrı "en son ne zaman söylendi" hafızası — böylece
+  // örn. "insan" 2 saniye önce söylendiyse susturulur ama aynı anda yeni
+  // görünen "sandalye" yine de söylenir (bkz. rapor Bölüm 10).
+  final Map<String, DateTime> _lastSpokenAtByLabel = {};
 
   @override
   void initState() {
@@ -178,36 +180,46 @@ class _CameraScreenState extends State<CameraScreen>
   ) async {
     if (detections.isEmpty) return;
 
-    final top = detections.first;
-
-    // Temporal consistency: aynı etiketi art arda 4 saniyeden önce tekrar
-    // söyleme (bkz. rapor Bölüm 10 — "Araba. Araba. Araba." önleme).
     final now = DateTime.now();
-    final sameLabel = _lastSpokenLabel == top.labelTr;
-    final tooSoon = now.difference(_lastSpokenAt) < const Duration(seconds: 4);
-    if (sameLabel && tooSoon) return;
 
-    _lastSpokenLabel = top.labelTr;
-    _lastSpokenAt = now;
+    // Temporal consistency: her nesneyi kendi 4 saniyelik susturma
+    // penceresine göre filtrele (rapor Bölüm 10 — "Araba. Araba. Araba."
+    // önleme, ama artık nesne bazlı, tek etiket bazlı değil).
+    final toSpeak = detections.where((d) {
+      final last = _lastSpokenAtByLabel[d.labelTr];
+      final tooSoon =
+          last != null && now.difference(last) < const Duration(seconds: 4);
+      return !tooSoon;
+    }).toList();
 
-    String message = '${top.labelTr} ${top.position}';
+    if (toSpeak.isEmpty) return;
 
-    if (_depthReady) {
-      try {
-        final distanceLabel = await _depthService.estimateDistanceLabel(
-          sourceImage,
-          focusXRatio: top.xRatio,
-          focusYRatio: top.yRatio,
-        );
-        if (distanceLabel != null) {
-          message = '${top.labelTr} ${top.position}, $distanceLabel';
-        }
-      } catch (e) {
-        debugPrint('Derinlik tahmini başarısız, mesafesiz devam: $e');
-      }
+    for (final d in toSpeak) {
+      _lastSpokenAtByLabel[d.labelTr] = now;
     }
 
-    await _tts.speak(message);
+    // Derinlik şu an devre dışı (Faz 1 - Görev 3 ertelendi), ama
+    // _depthReady true olursa ilk nesne için mesafe eklemeye devam eder.
+    final parts = <String>[];
+    for (final d in toSpeak) {
+      String part = '${d.labelTr} ${d.position}';
+      if (_depthReady && d == toSpeak.first) {
+        try {
+          final distanceLabel = await _depthService.estimateDistanceLabel(
+            sourceImage,
+            focusXRatio: d.xRatio,
+            focusYRatio: d.yRatio,
+          );
+          if (distanceLabel != null) part = '$part, $distanceLabel';
+        } catch (e) {
+          debugPrint('Derinlik tahmini başarısız, mesafesiz devam: $e');
+        }
+      }
+      parts.add(part);
+    }
+
+    // Örnek: "solunuzda insan, önünüzde sandalye, sağınızda kapı"
+    await _tts.speak(parts.join(', '));
   }
 
   @override
