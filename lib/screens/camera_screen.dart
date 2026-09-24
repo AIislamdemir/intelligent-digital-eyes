@@ -1,19 +1,18 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show rootBundle;
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../main.dart';
 import '../services/tts_service.dart';
 import '../services/object_detection_service.dart';
 import '../services/depth_estimation_service.dart';
+import '../services/ocr_service.dart';
 
 /// AccessAI'ın ana ekranı.
 ///
-/// Faz 1 - Görev 2: YOLO26-N artık gerçek zamanlı çalışıyor.
-/// Tasarım kararı: her kamera karesinde DEĞİL, ~900ms'de bir kare
-/// işleniyor (bkz. teknoloji karar raporu Bölüm 2 — sürekli VLM/CV
-/// çalıştırmak yerine kontrollü örnekleme, pil ve gecikme için).
+/// Faz 1 - Görev 5: OCR ("Oku" komutu) eklendi.
+/// Diğer özellikler: YOLO26-N nesne algılama (çoklu, en fazla 3),
+/// derinlik tahmini (opsiyonel, hâlâ ertelenmiş durumda olabilir).
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
 
@@ -27,6 +26,7 @@ class _CameraScreenState extends State<CameraScreen>
   final TtsService _tts = TtsService();
   final ObjectDetectionService _detector = ObjectDetectionService();
   final DepthEstimationService _depthService = DepthEstimationService();
+  final OcrService _ocrService = OcrService();
 
   bool _permissionGranted = false;
   bool _cameraReady = false;
@@ -34,12 +34,10 @@ class _CameraScreenState extends State<CameraScreen>
   bool _depthReady = false;
   bool _detectionActive = false; // "Çevreyi Tarif Et" açık/kapalı
   bool _isProcessingFrame = false;
+  bool _isReadingText = false; // "Oku" işlemi sırasında true
   String _statusMessage = 'Başlatılıyor...';
 
   Timer? _detectionTimer;
-  // Her etiket için ayrı "en son ne zaman söylendi" hafızası — böylece
-  // örn. "insan" 2 saniye önce söylendiyse susturulur ama aynı anda yeni
-  // görünen "sandalye" yine de söylenir (bkz. rapor Bölüm 10).
   final Map<String, DateTime> _lastSpokenAtByLabel = {};
 
   @override
@@ -69,8 +67,6 @@ class _CameraScreenState extends State<CameraScreen>
       _depthReady = true;
     } catch (e) {
       debugPrint('Derinlik modeli yüklenemedi (mesafesiz devam edilecek): $e');
-      // Kritik değil: derinlik modeli yüklenemezse sistem sadece konum
-      // söylemeye devam eder, mesafe bilgisi olmadan (kademeli bozulma).
     }
   }
 
@@ -147,6 +143,46 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
+  /// "Oku" butonuna basınca tek seferlik OCR çalıştırır.
+  /// Sürekli algılamadan bağımsız — aynı anda ikisi birden çalışmaz,
+  /// OCR sırasında sürekli algılama geçici olarak durur (kaynak
+  /// çakışmasını önlemek için, aynı kamera stream'i paylaşılıyor).
+  Future<void> _onReadTapped() async {
+    final controller = _controller;
+    if (controller == null || !_cameraReady || _isReadingText) return;
+
+    setState(() => _isReadingText = true);
+    await _tts.speak('Okunuyor...');
+
+    final wasDetectionActive = _detectionActive;
+    if (wasDetectionActive) {
+      _detectionTimer?.cancel();
+    }
+
+    try {
+      await controller.startImageStream((CameraImage image) async {
+        await controller.stopImageStream();
+        final text = await _ocrService.readText(image, controller.description);
+
+        if (text == null || text.length < 2) {
+          await _tts.speak(
+              'Metin bulamadım. Kamerayı yazıya doğrultup tekrar deneyin.');
+        } else {
+          await _tts.speak(text);
+        }
+
+        setState(() => _isReadingText = false);
+        if (wasDetectionActive) {
+          _startDetectionLoop();
+        }
+      });
+    } catch (e) {
+      debugPrint('OCR sırasında hata: $e');
+      setState(() => _isReadingText = false);
+      await _tts.speak('Metin okunurken bir sorun oluştu.');
+    }
+  }
+
   void _startDetectionLoop() {
     _detectionTimer?.cancel();
     _detectionTimer = Timer.periodic(const Duration(milliseconds: 900), (_) {
@@ -157,11 +193,10 @@ class _CameraScreenState extends State<CameraScreen>
   Future<void> _processFrame() async {
     final controller = _controller;
     if (controller == null || _isProcessingFrame || !_detectionActive) return;
+    if (_isReadingText) return; // OCR sırasında algılamayı ara
 
     _isProcessingFrame = true;
     try {
-      // startImageStream yerine periyodik tek-kare yaklaşımı: basitlik ve
-      // pil tüketimi için. V2'de gerçek stream + arka plan izole edilebilir.
       await controller.startImageStream((CameraImage image) async {
         await controller.stopImageStream();
         final detections = await _detector.runOnFrame(image);
@@ -182,9 +217,6 @@ class _CameraScreenState extends State<CameraScreen>
 
     final now = DateTime.now();
 
-    // Temporal consistency: her nesneyi kendi 4 saniyelik susturma
-    // penceresine göre filtrele (rapor Bölüm 10 — "Araba. Araba. Araba."
-    // önleme, ama artık nesne bazlı, tek etiket bazlı değil).
     final toSpeak = detections.where((d) {
       final last = _lastSpokenAtByLabel[d.labelTr];
       final tooSoon =
@@ -198,8 +230,6 @@ class _CameraScreenState extends State<CameraScreen>
       _lastSpokenAtByLabel[d.labelTr] = now;
     }
 
-    // Derinlik şu an devre dışı (Faz 1 - Görev 3 ertelendi), ama
-    // _depthReady true olursa ilk nesne için mesafe eklemeye devam eder.
     final parts = <String>[];
     for (final d in toSpeak) {
       String part = '${d.labelTr} ${d.position}';
@@ -218,7 +248,6 @@ class _CameraScreenState extends State<CameraScreen>
       parts.add(part);
     }
 
-    // Örnek: "solunuzda insan, önünüzde sandalye, sağınızda kapı"
     await _tts.speak(parts.join(', '));
   }
 
@@ -242,6 +271,7 @@ class _CameraScreenState extends State<CameraScreen>
     _controller?.dispose();
     _detector.dispose();
     _depthService.dispose();
+    _ocrService.dispose();
     _tts.dispose();
     super.dispose();
   }
@@ -266,23 +296,42 @@ class _CameraScreenState extends State<CameraScreen>
                     bottom: 32,
                     left: 24,
                     right: 24,
-                    child: Semantics(
-                      label: _detectionActive
-                          ? 'Çevre algılama açık. Kapatmak için dokunun.'
-                          : 'Çevreyi tarif et. Dokunarak etkinleştirin.',
-                      button: true,
-                      child: ElevatedButton(
-                        onPressed: _onDescribeTapped,
-                        style: ElevatedButton.styleFrom(
-                          minimumSize: const Size.fromHeight(72),
-                          textStyle: const TextStyle(fontSize: 22),
-                          backgroundColor:
-                              _detectionActive ? Colors.green : null,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Semantics(
+                          label: _detectionActive
+                              ? 'Çevre algılama açık. Kapatmak için dokunun.'
+                              : 'Çevreyi tarif et. Dokunarak etkinleştirin.',
+                          button: true,
+                          child: ElevatedButton(
+                            onPressed: _onDescribeTapped,
+                            style: ElevatedButton.styleFrom(
+                              minimumSize: const Size.fromHeight(72),
+                              textStyle: const TextStyle(fontSize: 22),
+                              backgroundColor:
+                                  _detectionActive ? Colors.green : null,
+                            ),
+                            child: Text(_detectionActive
+                                ? 'Algılama Açık (Durdur)'
+                                : 'Çevreyi Tarif Et'),
+                          ),
                         ),
-                        child: Text(_detectionActive
-                            ? 'Algılama Açık (Durdur)'
-                            : 'Çevreyi Tarif Et'),
-                      ),
+                        const SizedBox(height: 12),
+                        Semantics(
+                          label: 'Oku. Kameradaki yazıyı sesli okur.',
+                          button: true,
+                          child: ElevatedButton(
+                            onPressed: _isReadingText ? null : _onReadTapped,
+                            style: ElevatedButton.styleFrom(
+                              minimumSize: const Size.fromHeight(72),
+                              textStyle: const TextStyle(fontSize: 22),
+                              backgroundColor: Colors.orange,
+                            ),
+                            child: Text(_isReadingText ? 'Okunuyor...' : 'Oku'),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ],
